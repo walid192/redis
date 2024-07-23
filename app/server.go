@@ -7,103 +7,58 @@ import (
 	"net"
 	"os"
 	"strings"
-	"syscall"
 )
 
 var (
-	listen = flag.String("listen", ":6379", "adress to listen to")
+	listen = flag.String("listen", ":6379", "address to listen to")
 )
 
 func main() {
 	flag.Parse()
 
-	err := runServer(*listen)
+	l, err := net.Listen("tcp", *listen)
 	if err != nil {
-		fmt.Println("Error starting server: ", err.Error())
+		fmt.Println("Error starting server:", err)
 		os.Exit(1)
 	}
-
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
-	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
-		os.Exit(1)
-	}
-	_, err = l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
-	}
-
-
 	defer l.Close()
 
 	fmt.Println("Server is listening on", *listen)
 
-	clients:=make(map[int]net.Conn)
-	fdToConn:=make(map[int]int)
+	connChan := make(chan net.Conn)
+	closeChan := make(chan net.Conn)
 
+	go acceptConnections(l, connChan)
 
-	readFds:=&syscall.FdSet{}
+	activeConnections := make(map[net.Conn]struct{})
 
 	for {
-		clearFds(readFds)
-
-		fd := int(listener.(*net.TCPListener).File().Fd())
-		syscall.FD_SET(fd, readFds)
-
-		for clientFd := range clients {
-			syscall.FD_SET(clientFd, readFds)
+		select {
+		case conn := <-connChan:
+			activeConnections[conn] = struct{}{}
+			go handleConnection(conn, closeChan)
+		case conn := <-closeChan:
+			delete(activeConnections, conn)
+			conn.Close()
 		}
+	}
+}
 
-		_, err := syscall.Select(fd+1, readFds, nil, nil, nil)
+func acceptConnections(l net.Listener, connChan chan net.Conn) {
+	for {
+		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error with select:", err)
+			fmt.Println("Error accepting connection:", err)
 			continue
 		}
-
-		if syscall.FD_ISSET(fd, readFds) {
-			conn, err := listener.Accept()
-			if err != nil {
-				fmt.Println("Error accepting connection:", err)
-				continue
-			}
-
-			clientFd := int(conn.(*net.TCPConn).File().Fd())
-			clients[clientFd] = conn
-			fdToConn[clientFd] = clientFd
-			fmt.Println("New client connected:", clientFd)
-		}
-
-		for clientFd := range clients {
-			if syscall.FD_ISSET(clientFd, readFds) {
-				handleRequest(clients[clientFd])
-			}
-		}
-
+		connChan <- conn
 	}
 }
 
-
-func clearFds(fds *syscall.FdSet) {
-	for i := 0; i < len(fds.Bits); i++ {
-		fds.Bits[i] = 0
-	}
-}
-
-
-func runServer(listen string) error {
-	l, err := net.Listen("tcp", listen)
-	if err != nil {
-		return err
-	}
-	defer l.Close()
-	fmt.Printf("Listening on %s...\n", listen)
-	return nil
-}
-
-
-func handleRequest(conn net.Conn) {
-	defer conn.Close()
+func handleConnection(conn net.Conn, closeChan chan net.Conn) {
+	defer func() {
+		closeChan <- conn
+	}()
 
 	reader := bufio.NewReader(conn)
 	for {
